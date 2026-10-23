@@ -1,2 +1,5 @@
+flask
+line-bot-sdk
 gspread
 requests
+gunicorn
