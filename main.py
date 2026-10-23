@@ -2,11 +2,10 @@ import os
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, ImageMessage
 
 app = Flask(__name__)
 
-# ดึงค่าจาก Environment Variable บน Render
 line_bot_api = LineBotApi(os.environ.get('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('CHANNEL_SECRET'))
 
@@ -22,14 +21,15 @@ def callback():
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    user_text = event.message.text
-    # ตอบกลับข้อความทดสอบเบื้องต้น
-    reply_message = f"ได้รับข้อความแล้ว: {user_text}"
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_message)
-    )
+def handle_text_message(event):
+    user_text = event.message.text.strip()
+    # ตรงนี้บอทจะรับข้อความไปประมวลผลเงียบๆ โดยไม่ส่งข้อความตอบกลับ
+    print(f"ได้รับข้อความ: {user_text}")
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    # ตรงนี้บอทจะรับรูปภาพ/สลิปไปประมวลผลเงียบๆ โดยไม่ส่งข้อความตอบกลับเช่นกัน
+    print("ได้รับรูปภาพ/สลิปแล้ว")
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
