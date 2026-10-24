@@ -4,6 +4,8 @@ import json
 import base64
 import threading
 import time
+import re
+import unicodedata
 import traceback
 from datetime import datetime, timezone, timedelta
 
@@ -30,6 +32,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 SHEET_ID = os.environ.get("SHEET_ID")
 TH_TZ = timezone(timedelta(hours=7))
+SEARCH_COMMAND = "slip"  # คำสั่งค้นหาในกลุ่ม เช่น "slip จริส"
 
 MODELS = [GEMINI_MODEL]
 if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
@@ -45,6 +48,13 @@ PROMPT = (
 
 def log(*args):
     print(*args, flush=True)
+
+
+def norm(s):
+    """ทำข้อความให้เทียบกันได้: NFKC, ตัดช่องว่างและอักขระล่องหน, ตัวพิมพ์เล็ก"""
+    s = unicodedata.normalize("NFKC", str(s))
+    s = re.sub(r"[\s\u200b\u200c\u200d\u2060\ufeff]+", "", s)
+    return s.lower()
 
 
 # ---------------------------------------------------------------- Google Sheet
@@ -208,10 +218,11 @@ def handle_image(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text = event.message.text.strip()
-    # ตอบเฉพาะเมื่อพิมพ์ "หา " ตามด้วยคำค้น (กันตอบมั่วเวลาคุยปกติ)
-    if not text.startswith("หา "):
+    # ตอบเฉพาะเมื่อพิมพ์ "slip " ตามด้วยคำค้น (ไม่สนตัวพิมพ์เล็ก/ใหญ่) กันตอบมั่วเวลาคุยปกติ
+    parts = text.split(None, 1)
+    if len(parts) < 2 or parts[0].lower() != SEARCH_COMMAND:
         return
-    keyword = text[2:].strip().lower()
+    keyword = norm(parts[1])
     if not keyword:
         return
 
@@ -222,7 +233,8 @@ def handle_text(event):
         log(traceback.format_exc())
         return
 
-    found = [r for r in rows if keyword in " ".join(r[:6]).lower()]
+    found = [r for r in rows if keyword in norm(" ".join(r[:6]))]
+    log("SEARCH keyword =", repr(keyword), "rows =", len(rows), "found =", len(found))
     if not found:
         msg = f"ไม่พบสลิปที่ตรงกับ [{keyword}]"
     else:
