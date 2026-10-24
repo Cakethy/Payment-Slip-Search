@@ -215,15 +215,69 @@ def handle_image(event):
     ).start()
 
 
+THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+THAI_MONTHS = [  # (ชื่อเต็ม, ชื่อย่อ ไม่มีจุด)
+    ("มกราคม", "มค"), ("กุมภาพันธ์", "กพ"), ("มีนาคม", "มีค"), ("เมษายน", "เมย"),
+    ("พฤษภาคม", "พค"), ("มิถุนายน", "มิย"), ("กรกฎาคม", "กค"), ("สิงหาคม", "สค"),
+    ("กันยายน", "กย"), ("ตุลาคม", "ตค"), ("พฤศจิกายน", "พย"), ("ธันวาคม", "ธค"),
+]
+
+
+def to_ce_year(y):
+    """รับปี 2 หลัก/4 หลัก (ค.ศ. หรือ พ.ศ.) คืนค่าเป็น ค.ศ. 4 หลัก
+    26 -> 2026, 69 -> 2026 (พ.ศ. 2569), 2569 -> 2026, 2026 -> 2026"""
+    y = int(y)
+    if y < 100:
+        return 2000 + y if y < 43 else y + 2500 - 543
+    if y >= 2400:
+        return y - 543
+    return y
+
+
+def parse_slip_month(date_text):
+    """อ่านเดือน/ปีจากคอลัมน์ 'วันที่ในสลิป' เช่น '16 ต.ค. 2569 - 17:03'
+    คืนค่า (เดือน, ปี ค.ศ.) หรือ None ถ้าอ่านไม่ได้"""
+    s = unicodedata.normalize("NFKC", str(date_text)).translate(THAI_DIGITS)
+    s = s.replace(".", "")
+
+    # รูปแบบตัวเลข เช่น 16/10/2569
+    m = re.search(r"(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{4}|\d{2})(?!\d)", s)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return int(m.group(2)), to_ce_year(m.group(3))
+
+    month = None
+    for i, (full, abbr) in enumerate(THAI_MONTHS, 1):
+        if full in s or abbr in s:
+            month = i
+            break
+    y = re.search(r"(?<!\d)(\d{4})(?!\d)", s)
+    if month and y:
+        return month, to_ce_year(y.group(1))
+    return None
+
+
+def parse_month_filter(query):
+    """แยกเงื่อนไขเดือนออกจากคำค้น เช่น 'expe เดือน 9/26' หรือ 'expe 9/2569'
+    คืนค่า (คำค้นที่เหลือ, (เดือน, ปี ค.ศ.) หรือ None)"""
+    m = re.search(r"(?:เดือน\s*)?(?<!\d)(\d{1,2})\s*/\s*(\d{4}|\d{2})(?!\d)", query)
+    if m and 1 <= int(m.group(1)) <= 12:
+        rest = (query[:m.start()] + " " + query[m.end():]).strip()
+        return rest, (int(m.group(1)), to_ce_year(m.group(2)))
+    return query, None
+
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text = event.message.text.strip()
-    # ตอบเฉพาะเมื่อพิมพ์ "slip " ตามด้วยคำค้น (ไม่สนตัวพิมพ์เล็ก/ใหญ่) กันตอบมั่วเวลาคุยปกติ
+    # ตอบเฉพาะเมื่อพิมพ์ "slip ..." (ไม่สนตัวพิมพ์เล็ก/ใหญ่) กันตอบมั่วเวลาคุยปกติ
+    # ตัวอย่าง: "slip จริส" / "slip expe เดือน 9/26" / "slip เดือน 10/26"
     parts = text.split(None, 1)
     if len(parts) < 2 or parts[0].lower() != SEARCH_COMMAND:
         return
-    keyword = norm(parts[1])
-    if not keyword:
+
+    rest, month_filter = parse_month_filter(parts[1])
+    keyword = norm(rest)
+    if not keyword and not month_filter:
         return
 
     try:
@@ -233,10 +287,28 @@ def handle_text(event):
         log(traceback.format_exc())
         return
 
-    found = [r for r in rows if keyword in norm(" ".join(r[:6]))]
-    log("SEARCH keyword =", repr(keyword), "rows =", len(rows), "found =", len(found))
+    found = [r for r in rows if keyword in norm(" ".join(r[:6]))] if keyword else list(rows)
+
+    unreadable = 0
+    if month_filter:
+        in_month = []
+        for r in found:
+            ym = parse_slip_month(r[1]) if len(r) > 1 else None
+            if ym is None:
+                unreadable += 1
+            elif ym == month_filter:
+                in_month.append(r)
+        found = in_month
+
+    log("SEARCH keyword =", repr(keyword), "month =", month_filter,
+        "rows =", len(rows), "found =", len(found), "unreadable_date =", unreadable)
+
+    label = f"[{rest.strip()}]" if rest.strip() else ""
+    if month_filter:
+        label = (label + f" เดือน {month_filter[0]}/{month_filter[1] + 543}").strip()
+
     if not found:
-        msg = f"ไม่พบสลิปที่ตรงกับ [{keyword}]"
+        msg = f"ไม่พบสลิปที่ตรงกับ {label}"
     else:
         total = 0.0
         for r in found:
@@ -244,10 +316,16 @@ def handle_text(event):
                 total += float(str(r[4]).replace(",", ""))
             except (ValueError, IndexError):
                 pass
-        lines = [f"พบ {len(found)} สลิป รวม {total:,.2f} บาท\n"]
-        for r in reversed(found[-15:]):
+        lines = [f"พบ {len(found)} สลิป {label} รวม {total:,.2f} บาท\n"]
+        shown = found[-15:]
+        for r in reversed(shown):
             lines.append(f"- {r[1] or r[0]} | {r[3]} | {r[4]} บาท | อ้างอิง {r[5]}")
+        if len(found) > len(shown):
+            lines.append(f"\n(แสดง {len(shown)} รายการล่าสุด จากทั้งหมด {len(found)})")
         msg = "\n".join(lines)
+
+    if unreadable:
+        msg += f"\n\nหมายเหตุ: มี {unreadable} แถวที่อ่านวันที่ในสลิปไม่ได้ จึงไม่นับรวม"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
 
