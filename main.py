@@ -31,8 +31,13 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 SHEET_ID = os.environ.get("SHEET_ID")
+CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
 TH_TZ = timezone(timedelta(hours=7))
-SEARCH_COMMAND = "slip"  # คำสั่งค้นหาในกลุ่ม เช่น "slip จริส"
+SEARCH_COMMAND = "หา"  # คำสั่งค้นหาในกลุ่ม เช่น "หา จริส" (ต้องเว้นวรรคหลังคำว่า หา)
+MAX_QUOTES = 4         # ตอบกลับ (quote) สลิปได้สูงสุด 4 ใบต่อการค้นหา (LINE ให้ตอบได้ 5 ข้อความ/ครั้ง)
+
+# message_id ของรูป -> quoteToken (ดึงจาก webhook ดิบ ใช้ตอน reply สลิปภายหลัง)
+QUOTE_TOKENS = {}
 
 MODELS = [GEMINI_MODEL]
 if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
@@ -146,7 +151,7 @@ def read_slip(image_bytes):
 
 
 # ------------------------------------------------------------ ประมวลผลสลิป
-def process_slip(message_id, group_id):
+def process_slip(message_id, group_id, quote_token=""):
     # ทำงานเงียบๆ เบื้องหลัง ไม่ตอบกลับในกลุ่ม
     try:
         log("1) รับสลิป message_id =", message_id)
@@ -178,8 +183,9 @@ def process_slip(message_id, group_id):
             data.get("ref", ""),
             message_id,
             group_id,
+            quote_token or "",   # คอลัมน์ I = quote_token ใช้ตอบกลับสลิปใบนี้
         ])
-        log("4) บันทึกลง Sheet แล้ว")
+        log("4) บันทึกลง Sheet แล้ว", "(มี quote_token)" if quote_token else "(ไม่มี quote_token)")
     except Exception:
         log("ERROR process_slip:")
         log(traceback.format_exc())
@@ -190,6 +196,16 @@ def process_slip(message_id, group_id):
 def callback():
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
+
+    # เก็บ quoteToken ของรูปจาก webhook ดิบ (SDK รุ่นเก่าอาจไม่ส่งค่านี้มาให้)
+    try:
+        for ev in json.loads(body).get("events", []):
+            m = ev.get("message") or {}
+            if m.get("type") == "image" and m.get("quoteToken"):
+                QUOTE_TOKENS[m["id"]] = m["quoteToken"]
+    except Exception:
+        pass
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -202,16 +218,46 @@ def health():
     return "OK"
 
 
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image(event):
+def chat_id_of(event):
     src = event.source
-    group_id = (
+    return (
         getattr(src, "group_id", None)
         or getattr(src, "room_id", None)
         or getattr(src, "user_id", "")
     )
+
+
+def line_reply(reply_token, messages):
+    """ตอบกลับผ่าน Messaging API โดยตรง (รองรับ quoteToken)"""
+    try:
+        r = requests.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers={"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
+            json={"replyToken": reply_token, "messages": messages},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as e:
+        log("LINE reply error:", type(e).__name__)
+        return False
+    if not r.ok:
+        log("LINE reply HTTP", r.status_code, r.text[:300])
+        return False
+    return True
+
+
+def fmt_amount(v):
+    try:
+        return f"{float(str(v).replace(',', '')):,.2f}"
+    except ValueError:
+        return str(v)
+
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image(event):
+    msg_id = event.message.id
+    quote_token = QUOTE_TOKENS.pop(msg_id, None) or getattr(event.message, "quote_token", None) or ""
     threading.Thread(
-        target=process_slip, args=(event.message.id, group_id), daemon=True
+        target=process_slip, args=(msg_id, chat_id_of(event), quote_token), daemon=True
     ).start()
 
 
@@ -269,8 +315,8 @@ def parse_month_filter(query):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text = event.message.text.strip()
-    # ตอบเฉพาะเมื่อพิมพ์ "slip ..." (ไม่สนตัวพิมพ์เล็ก/ใหญ่) กันตอบมั่วเวลาคุยปกติ
-    # ตัวอย่าง: "slip จริส" / "slip expe เดือน 9/26" / "slip เดือน 10/26"
+    # ตอบเฉพาะเมื่อพิมพ์ "หา ..." (เว้นวรรคหลัง หา) กันตอบมั่วเวลาคุยปกติ เช่นคำว่า "หาย"
+    # ตัวอย่าง: "หา จริส" / "หา expe เดือน 9/26" / "หา เดือน 10/26"
     parts = text.split(None, 1)
     if len(parts) < 2 or parts[0].lower() != SEARCH_COMMAND:
         return
@@ -307,6 +353,7 @@ def handle_text(event):
     if month_filter:
         label = (label + f" เดือน {month_filter[0]}/{month_filter[1] + 543}").strip()
 
+    quotes = []
     if not found:
         msg = f"ไม่พบสลิปที่ตรงกับ {label}"
     else:
@@ -319,15 +366,32 @@ def handle_text(event):
         lines = [f"พบ {len(found)} สลิป {label} รวม {total:,.2f} บาท\n"]
         shown = found[-15:]
         for r in reversed(shown):
-            lines.append(f"- {r[1] or r[0]} | {r[3]} | {r[4]} บาท | อ้างอิง {r[5]}")
+            lines.append(f"- {r[1] or r[0]} | {r[3]} | {fmt_amount(r[4])} บาท | อ้างอิง {r[5]}")
         if len(found) > len(shown):
             lines.append(f"\n(แสดง {len(shown)} รายการล่าสุด จากทั้งหมด {len(found)})")
+
+        # สลิปที่ reply ได้: ต้องมี quote_token (คอลัมน์ I) และถูกส่งในแชทเดียวกับที่ค้นหา
+        chat_id = chat_id_of(event)
+        quotable = [r for r in found if len(r) > 8 and r[8] and r[7] == chat_id]
+        quotes = quotable[-MAX_QUOTES:]
+        if quotes:
+            lines.append(f"\n👇 ตอบกลับสลิป {len(quotes)} ใบล่าสุดให้ด้านล่างครับ")
         msg = "\n".join(lines)
 
     if unreadable:
         msg += f"\n\nหมายเหตุ: มี {unreadable} แถวที่อ่านวันที่ในสลิปไม่ได้ จึงไม่นับรวม"
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+    messages = [{"type": "text", "text": msg[:5000]}]
+    for r in reversed(quotes):
+        messages.append({
+            "type": "text",
+            "text": f"สลิปนี้ครับ: {r[1] or r[0]} | {r[3]} | {fmt_amount(r[4])} บาท",
+            "quoteToken": r[8],
+        })
+
+    # ถ้าตอบพร้อม quote ไม่สำเร็จ (เช่น token ใช้ไม่ได้) ให้ตอบเฉพาะสรุปแทน
+    if not line_reply(event.reply_token, messages) and len(messages) > 1:
+        line_reply(event.reply_token, messages[:1])
 
 
 if __name__ == "__main__":
